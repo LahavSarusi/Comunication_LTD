@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Secrets - never commit real environment files
+.env
+.env.*
+!.env.example
+
+# SQLite database (contains user salts and hashes)
+backend/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Build output
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

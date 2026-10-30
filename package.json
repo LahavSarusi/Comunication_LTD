@@ -1,0 +1,18 @@
+{
+  "name": "communication-ltd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Communication_LTD - secure web system (cybersecurity course final project)",
+  "scripts": {
+    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend",
+    "dev": "concurrently -n api,web -c blue,magenta \"npm --prefix backend run dev\" \"npm --prefix frontend run dev\"",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
