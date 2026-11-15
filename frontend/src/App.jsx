@@ -1,7 +1,17 @@
+import { useState } from 'react'
+import ChangePassword from './components/ChangePassword/ChangePassword.jsx'
 import Register from './components/Register/Register.jsx'
 import './App.css'
 
+const SCREENS = [
+  { id: 'register', label: 'Register', Component: Register },
+  { id: 'change-password', label: 'Change password', Component: ChangePassword },
+]
+
 function App() {
+  const [screenId, setScreenId] = useState(SCREENS[0].id)
+  const { Component } = SCREENS.find((screen) => screen.id === screenId)
+
   return (
     <div className="app">
       <header className="app-header">
@@ -10,10 +20,28 @@ function App() {
       </header>
 
       <main className="app-main">
-        <Register />
+        <div className="app-content">
+          <nav className="screen-tabs" aria-label="Screens">
+            {SCREENS.map((screen) => (
+              <button
+                key={screen.id}
+                type="button"
+                className="screen-tab"
+                aria-current={screen.id === screenId ? 'page' : undefined}
+                onClick={() => setScreenId(screen.id)}
+              >
+                {screen.label}
+              </button>
+            ))}
+          </nav>
+
+          {/* Only the active screen is mounted, so switching screens discards
+              everything typed in the other one, passwords included. */}
+          <Component key={screenId} />
+        </div>
       </main>
 
-      <footer className="app-footer">Communication_LTD · Secure registration</footer>
+      <footer className="app-footer">Communication_LTD · Secure account management</footer>
     </div>
   )
 }

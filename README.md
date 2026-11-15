@@ -1,7 +1,8 @@
 # Communication_LTD - Secure Web System (Part A)
 
 Web information system for **Communication_LTD**, a fictional company that markets internet
-packages. Part A focuses on **secure development**, centred on the user registration mechanism.
+packages. Part A focuses on **secure development**: user registration and the change-password
+screen are implemented.
 
 | Layer    | Technology                                                       |
 | -------- | ---------------------------------------------------------------- |
@@ -34,7 +35,8 @@ Comunication_LTD/
 │       ├── validation/userSchemas.js # Zod registration schema built from the policy
 │       ├── utils/crypto.js           # salt, HMAC-SHA256, timing-safe verify
 │       ├── middleware/               # validate (Zod), errorHandler
-│       └── routes/auth.routes.js     # /api/auth/password-policy, /api/auth/register
+│       └── routes/auth.routes.js     # /api/auth/password-policy, /register, /change-password
+│   └── test/                         # automated API tests (node --test)
 └── frontend/               # React app (ES modules) - its own package.json & node_modules
     ├── .env.example        # optional API URL override
     ├── vite.config.js      # fixed port 5173 (must match backend CORS_ORIGIN)
@@ -42,7 +44,9 @@ Comunication_LTD/
         ├── App.jsx
         ├── api/client.js                    # Axios instance + error mapping
         ├── validation/registerSchema.js     # client-side Zod rules (built from the server policy)
-        └── components/Register/             # Register.jsx + Register.css
+        ├── validation/changePasswordSchema.js
+        ├── components/Register/             # Register.jsx + Register.css
+        └── components/ChangePassword/       # ChangePassword.jsx (reuses Register.css)
 ```
 
 Backend and frontend are fully separate npm projects (no npm workspaces), so their
@@ -157,7 +161,7 @@ and is managed by the system administrator.
 | `minLength`        | 10    | Minimum password length                                        |
 | `maxLength`        | 128   | Maximum length (prevents abuse with huge inputs)               |
 | `complexity`       | all `true` | Require uppercase, lowercase, digits, special characters  |
-| `historyCount`     | 3     | Previous passwords that may not be reused (change-password stage) |
+| `historyCount`     | 3     | Previous passwords that may not be reused when changing password |
 | `dictionary`       | list  | Password may not contain any of these words (case-insensitive) |
 | `maxLoginAttempts` | 3     | Failed logins before lockout (login stage)                     |
 
@@ -167,9 +171,9 @@ and is managed by the system administrator.
 - The React form downloads the public part of the policy (`GET /api/auth/password-policy`), so
   the browser checklist always matches the server. The dictionary and the login-attempt limit
   are **not** sent to the browser.
-- `historyCount` and `maxLoginAttempts` are already loaded and the database is ready for them
-  (`password_history` table, `failed_login_attempts` / `locked_until` columns); they are
-  enforced when change-password and login are implemented.
+- `historyCount` is enforced by `POST /api/auth/change-password`.
+- `maxLoginAttempts` is already loaded and the database is ready for it
+  (`failed_login_attempts` / `locked_until` columns); it is enforced when login is implemented.
 
 ---
 
@@ -187,6 +191,17 @@ Body (JSON, max 10 KB): `{ "username": "...", "email": "...", "password": "..." 
 | 400    | Validation failed → `{ error, formErrors, fieldErrors }`, or malformed JSON |
 | 409    | Username or email already in use (one combined message)                   |
 | 429    | More than 10 registration attempts from the same IP within 15 minutes     |
+| 500    | Unexpected error → generic message only                                   |
+
+### `POST /api/auth/change-password`
+Body (JSON, max 10 KB): `{ "username": "...", "currentPassword": "...", "newPassword": "..." }`
+
+| Status | When                                                                      |
+| ------ | ------------------------------------------------------------------------- |
+| 200    | Changed → `{ message }`                                                   |
+| 400    | Validation failed, or the new password equals the current one or one of the last `historyCount` passwords → `{ error, formErrors, fieldErrors }` |
+| 401    | Unknown username or wrong current password (one identical message)        |
+| 429    | More than 10 change attempts from the same IP within 15 minutes           |
 | 500    | Unexpected error → generic message only                                   |
 
 ### Database tables
@@ -212,8 +227,8 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
 - **HMAC with a secret key** (the key acts as a *pepper*): the key lives in `.env`, not in the
   database. An attacker who steals only the database file cannot even start guessing passwords
   without the key.
-- **Timing-safe verification** (`crypto.timingSafeEqual`) is prepared for login, so response
-  time does not reveal how much of a hash matched.
+- **Timing-safe verification** (`crypto.timingSafeEqual`) is used wherever a password is
+  checked, so response time does not reveal how much of a hash matched.
 - Registration writes the user and the first `password_history` row in **one transaction**
   (both or nothing).
 
@@ -282,6 +297,30 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
 - `autoComplete="new-password"`, confirm-password field, live policy checklist, password removed
   from memory after success, and separate messages for network, 400, 409, 429 and 500 errors.
 
+### 10. Change password
+[backend/src/routes/auth.routes.js](backend/src/routes/auth.routes.js)
+- The same pipeline as registration: strict Zod schema (strings only, no unknown keys),
+  normalized username checked against the allowlist, then an ORM lookup with a **bound
+  parameter**. `' OR 1=1--` as a username is rejected with `400`; as a password it is just a
+  wrong password (`401`).
+- **The current password is required** and verified with the stored salt and
+  `crypto.timingSafeEqual`. Knowing a username is not enough to change its password.
+- **No user enumeration**: an unknown username and a wrong password return the same `401`
+  message, and the unknown-username path still performs one HMAC comparison so its response
+  time is similar.
+- **Password history**: the new password is compared (each with its own salt) against the
+  current password and the last `historyCount` rows of `password_history`. A match returns `400`.
+- The new password gets the **full policy** (length, complexity, dictionary, must not contain
+  the username) and a **new random salt**.
+- The `users` update and the new `password_history` row are written in **one transaction**.
+- **Rate limited** (10 attempts / 15 minutes per IP), because every attempt is a guess at the
+  current password.
+- **Stored XSS**: the only user text this feature could store is the username, which the
+  allowlist limits to `a-z 0-9 _`; passwords are stored only as hashes. Responses never echo
+  submitted values, and React renders all text escaped.
+- In the browser, the password fields are cleared after success, the current password is
+  cleared after a `401`, and switching screens unmounts the form.
+
 ---
 
 ## Known limitations and production notes
@@ -292,11 +331,26 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
 - **Changing `HMAC_SECRET` invalidates every stored password** - keep it safe and backed up.
 - **HTTPS is mandatory in production** - the password travels in the request body.
 - The rate limiter keeps its counters in memory (reset on restart, per server instance).
+- Change password is limited per IP only. Account lockout after `maxLoginAttempts` failures
+  arrives with the login stage; until then a distributed attacker is slowed per address, not
+  per account.
 - `sequelize.sync()` creates missing tables only; production would use versioned migrations.
 - Keep the project outside OneDrive-synced folders (e.g. `C:\dev\`): syncing can lock the SQLite
   file and slows down `node_modules`.
 
 ---
+
+## Automated tests
+
+```powershell
+npm --prefix backend test
+```
+
+Runs the change-password API tests with Node's built-in test runner (no extra packages). They
+use a temporary SQLite file and a random HMAC secret, so the real database and `.env` secret are
+not touched. Covered: success, wrong password / unknown user (`401`), password history, weak and
+dictionary passwords, SQL injection, XSS and operator-object payloads, unknown keys, malformed
+JSON, and the rate limit.
 
 ## Manual tests (PowerShell)
 
@@ -313,6 +367,11 @@ Register "{`"username`":`"x' OR 1=1--`",`"email`":`"a@b.co`",`"password`":`"Gr8t
 Register '{"username":{"$gt":""},"email":"a@b.co","password":"Gr8t!Horizon#77"}'          # 400
 Register '{"username":"eve","email":"e@b.co","password":"Gr8t!Horizon#77","salt":"00"}'   # 400
 Register '{"username":"weak","email":"w@b.co","password":"MyPassword#2026"}'              # 400 (dictionary)
+
+$api = 'http://127.0.0.1:4000/api/auth/change-password'
+Register '{"username":"dana_2","currentPassword":"Gr8t!Horizon#77","newPassword":"Blue-Kettle_42x!"}'  # 200
+Register '{"username":"dana_2","currentPassword":"Gr8t!Horizon#77","newPassword":"Winter*Maple9Road"}' # 401 (old password)
+Register '{"username":"dana_2","currentPassword":"Blue-Kettle_42x!","newPassword":"Gr8t!Horizon#77"}'  # 400 (used recently)
 ```
 
 ## Troubleshooting
