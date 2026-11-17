@@ -49,3 +49,30 @@ export function parseApiError(error) {
       return { message: 'Something went wrong on our side. Please try again later.', fieldErrors: {} }
   }
 }
+
+// Sends only the two fields the API expects. The password goes to the server as
+// typed; it is compared against the stored HMAC hash server-side only.
+export async function loginUser({ username, password }) {
+  const { data } = await api.post('/api/auth/login', { username, password })
+  return data
+}
+
+/**
+ * Login-specific error messages. 401 deliberately does not say whether the
+ * username or the password was wrong; 423 shows the server's lockout message
+ * (plain text, rendered escaped by React). Everything else uses parseApiError.
+ */
+export function parseLoginError(error) {
+  const status = error.response?.status
+  if (status === 401) {
+    return { message: 'Incorrect username or password.', fieldErrors: {} }
+  }
+  if (status === 423) {
+    const serverMessage = error.response.data?.error
+    return {
+      message: typeof serverMessage === 'string' ? serverMessage : 'This account is temporarily locked. Please try again later.',
+      fieldErrors: {},
+    }
+  }
+  return parseApiError(error)
+}

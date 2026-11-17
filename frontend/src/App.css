@@ -33,6 +33,50 @@
   padding: 48px 16px;
 }
 
+.app-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 440px;
+}
+
+.screen-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.screen-tab {
+  flex: 1;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.screen-tab:hover {
+  color: var(--text-strong);
+}
+
+.screen-tab[aria-current='page'] {
+  color: var(--primary-text);
+  background: var(--primary);
+}
+
+.screen-tab:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
 .app-footer {
   padding: 16px;
   font-size: 13px;
