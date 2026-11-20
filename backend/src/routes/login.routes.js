@@ -67,17 +67,27 @@ async function findUserByUsername(username) {
   };
 }
 
-// Atomic "x = x + 1" that also returns the new value (RETURNING), so parallel
-// requests cannot slip extra guesses past the limit.
-async function incrementFailedAttempts(userId, now) {
+/**
+ * Reserves one login attempt BEFORE the password is checked, in a single atomic
+ * conditional UPDATE. SQLite runs it as one step, so parallel requests are counted
+ * one after another and each gets its own number (1, 2, 3, 4 ...).
+ * - The WHERE clause skips a locked account: no row comes back -> returns null.
+ * - A lock that has already expired is cleared and the count starts again at 1.
+ * The caller only checks the password when the returned number is within the limit,
+ * so at most maxLoginAttempts guesses are ever checked, however many arrive at once.
+ */
+async function reserveAttempt(userId, now) {
   const rows = await sequelize.query(
     `UPDATE users
-        SET failed_login_attempts = failed_login_attempts + 1, updated_at = $now
-      WHERE id = $id
+        SET failed_login_attempts = CASE WHEN locked_until IS NOT NULL AND locked_until <= $now
+                                         THEN 1 ELSE failed_login_attempts + 1 END,
+            locked_until = CASE WHEN locked_until <= $now THEN NULL ELSE locked_until END,
+            updated_at = $now
+      WHERE id = $id AND (locked_until IS NULL OR locked_until <= $now)
   RETURNING failed_login_attempts`,
     { bind: { id: userId, now: toSqliteDate(now) }, type: QueryTypes.SELECT },
   );
-  return rows[0].failed_login_attempts;
+  return rows.length === 0 ? null : rows[0].failed_login_attempts;
 }
 
 async function setLoginState(userId, failedLoginAttempts, lockedUntil, now) {
@@ -97,11 +107,28 @@ async function setLoginState(userId, failedLoginAttempts, lockedUntil, now) {
   );
 }
 
+// Locks the account unless a parallel request already did; returns the lock end time
+// that is actually stored, so every request reports the same time.
 async function lockAccount(userId, lockedUntil, now) {
-  await sequelize.query(
-    'UPDATE users SET locked_until = $lockedUntil, updated_at = $now WHERE id = $id',
-    { bind: { id: userId, lockedUntil: toSqliteDate(lockedUntil), now: toSqliteDate(now) }, type: QueryTypes.UPDATE },
+  const rows = await sequelize.query(
+    `UPDATE users
+        SET locked_until = CASE WHEN locked_until IS NULL OR locked_until <= $now
+                                THEN $lockedUntil ELSE locked_until END,
+            updated_at = $now
+      WHERE id = $id
+  RETURNING locked_until`,
+    { bind: { id: userId, lockedUntil: toSqliteDate(lockedUntil), now: toSqliteDate(now) }, type: QueryTypes.SELECT },
   );
+  return new Date(rows[0].locked_until);
+}
+
+// Current lock end time, read fresh (the row read at the start of the request may be stale).
+async function readLockedUntil(userId) {
+  const rows = await sequelize.query('SELECT locked_until FROM users WHERE id = $id', {
+    bind: { id: userId },
+    type: QueryTypes.SELECT,
+  });
+  return rows[0]?.locked_until ? new Date(rows[0].locked_until) : null;
 }
 
 /*
@@ -118,24 +145,6 @@ function lockedResponse(res, lockedUntil, now) {
   });
 }
 
-/**
- * Counts one failed login for an existing user and locks the account when the
- * policy limit (maxLoginAttempts) is reached. Returns the lock end time, or null.
- */
-async function recordFailedAttempt(user, now) {
-  // A lock that has already expired starts a fresh count.
-  if (user.lockedUntil && user.lockedUntil <= now) {
-    await setLoginState(user.id, 0, null, now);
-  }
-
-  const attempts = await incrementFailedAttempts(user.id, now);
-  if (attempts < policy.maxLoginAttempts) return null;
-
-  const lockedUntil = new Date(now.getTime() + LOCKOUT_MS);
-  await lockAccount(user.id, lockedUntil, now);
-  return lockedUntil;
-}
-
 // POST /api/auth/login  { username, password }
 router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
   const { username, password } = req.validatedBody;
@@ -143,32 +152,47 @@ router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
 
   const user = await findUserByUsername(username);
 
-  // While the account is locked the password is not even checked, so a locked
-  // account gives an attacker no information about whether a guess was right.
-  if (user?.lockedUntil && user.lockedUntil > now) {
-    return lockedResponse(res, user.lockedUntil, now);
+  // Unknown user: still run one HMAC comparison (against a dummy hash) so the
+  // response time does not reveal whether the account exists, then fail.
+  if (!user) {
+    verifyPassword(password, DUMMY_SALT, DUMMY_HASH);
+    return res.status(401).json({ error: INVALID_CREDENTIALS });
   }
 
-  // Recompute HMAC-SHA256(salt + password) and compare in constant time.
-  const passwordMatches = verifyPassword(
-    password,
-    user ? user.salt : DUMMY_SALT,
-    user ? user.passwordHash : DUMMY_HASH,
-  );
+  // 1) Reserve this attempt atomically BEFORE looking at the password. The decision
+  //    below uses this fresh number, never the row read above (which parallel
+  //    requests may already have made out of date).
+  const attempt = await reserveAttempt(user.id, now);
 
-  if (!user || !passwordMatches) {
-    if (user) {
-      const lockedUntil = await recordFailedAttempt(user, now);
-      if (lockedUntil) return lockedResponse(res, lockedUntil, now);
+  // Account is locked: the password is not even checked, so a locked account
+  // gives an attacker no information about whether a guess was right.
+  if (attempt === null) {
+    const lockedUntil = await readLockedUntil(user.id);
+    return lockedResponse(res, lockedUntil ?? new Date(now.getTime() + LOCKOUT_MS), now);
+  }
+
+  // Over the limit: parallel requests that arrived after the last allowed attempt.
+  // Lock (if no request has yet) and refuse without checking the password.
+  if (attempt > policy.maxLoginAttempts) {
+    const lockedUntil = await lockAccount(user.id, new Date(now.getTime() + LOCKOUT_MS), now);
+    return lockedResponse(res, lockedUntil, now);
+  }
+
+  // 2) Within the limit: recompute HMAC-SHA256(salt + password), constant-time compare.
+  if (!verifyPassword(password, user.salt, user.passwordHash)) {
+    // The last allowed attempt failed: lock the account.
+    if (attempt === policy.maxLoginAttempts) {
+      const lockedUntil = await lockAccount(user.id, new Date(now.getTime() + LOCKOUT_MS), now);
+      return lockedResponse(res, lockedUntil, now);
     }
     // One message for "no such user" and "wrong password" (no user enumeration).
     return res.status(401).json({ error: INVALID_CREDENTIALS });
   }
 
-  // Successful login: the failed-attempt counter starts over.
-  if (user.failedLoginAttempts !== 0 || user.lockedUntil !== null) {
-    await setLoginState(user.id, 0, null, now);
-  }
+  // 3) Correct password within the limit: the counter starts over. This can only run
+  //    for one of the first maxLoginAttempts guesses, so it never undoes a lock that
+  //    was earned by guesses over the limit.
+  await setLoginState(user.id, 0, null, now);
 
   // Only explicitly listed, non-secret fields are returned.
   return res.status(200).json({

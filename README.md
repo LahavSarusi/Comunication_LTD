@@ -321,12 +321,16 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
   so `' OR 1=1--` is rejected with `400` before any query runs. Type-confusion payloads
   (`{"$gt": ""}`) and extra keys are rejected too. A password is never part of any SQL: it is
   only fed into the HMAC.
-- **Account lockout (from the policy file):** each failed login raises `failed_login_attempts`
-  with one atomic `UPDATE ... SET x = x + 1 ... RETURNING x`, so parallel requests cannot slip
-  extra guesses past the limit. After `maxLoginAttempts` (3) consecutive failures, `locked_until` is set
-  `lockoutMinutes` (15) ahead and the API answers `423`. While locked, the password is **not
-  checked at all**, so even a correct guess gives the attacker no signal. A successful login
-  resets the counter; an expired lock starts a fresh count.
+- **Account lockout (from the policy file):** before the password is checked, one atomic conditional
+  `UPDATE ... WHERE <not locked> ... RETURNING failed_login_attempts` reserves the attempt, so parallel requests cannot slip
+  extra guesses past the limit: SQLite runs the statements one at a time, so 100 requests sent
+  at once get the numbers 1 to 100, and only numbers up to `maxLoginAttempts` (3) are allowed to
+  check the password. A locked account matches no row, and any number above the limit is refused,
+  both with `423` and without checking the password, so even a correct guess gives the attacker no
+  signal. When the last allowed attempt fails, `locked_until` is set `lockoutMinutes` (15) ahead.
+  A correct password within the limit resets the counter; the same `UPDATE` clears an expired
+  lock and starts a fresh count. Tested by sending 6 wrong passwords and the correct one in
+  parallel: only 3 passwords are checked and the correct one is refused with `423`.
 - **No user enumeration:** the server checks whether the user exists (requirement 3c), but an
   unknown username and a wrong password get the **same `401` message**, so the answer does not
   tell an attacker which usernames are registered (OWASP recommendation). For an unknown username
