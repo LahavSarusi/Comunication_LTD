@@ -52,6 +52,14 @@ export function parseApiError(error) {
       return { message: 'Incorrect username or current password.', fieldErrors: {} }
     case 409:
       return { message: 'This username or email is already in use.', fieldErrors: {} }
+    // Account lockout: the server's message says how long the lock lasts. It is plain
+    // text and rendered escaped by React.
+    case 423:
+      return {
+        message:
+          typeof data?.error === 'string' ? data.error : 'This account is temporarily locked. Please try again later.',
+        fieldErrors: {},
+      }
     case 429:
       return { message: 'Too many attempts. Please wait a few minutes and try again.', fieldErrors: {} }
     default:

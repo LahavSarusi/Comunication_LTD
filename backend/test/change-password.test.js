@@ -1,76 +1,18 @@
 // End-to-end tests for POST /api/auth/change-password.
 // Run with:  npm --prefix backend test      (Node's built-in test runner, no extra packages)
-//
-// The tests use their own throwaway SQLite file and their own HMAC secret, so they
-// never touch backend/data/database.sqlite or the real secret in backend/.env.
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
+// Setup (temporary database, own HMAC secret, fresh API per group) is in ./helpers.js.
 const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-
-const SRC_DIR = path.resolve(__dirname, '../src');
-const DB_FILE = path.join(os.tmpdir(), `communication-ltd-test-${process.pid}-${Date.now()}.sqlite`);
-
-// Set before anything under src/ is loaded. dotenv never overrides existing variables.
-process.env.NODE_ENV = 'test';
-process.env.DB_STORAGE = DB_FILE;
-process.env.HMAC_SECRET = crypto.randomBytes(32).toString('hex');
-process.env.CORS_ORIGIN = 'http://localhost:5173';
+const { startApi, DEFAULT_PASSWORD } = require('./helpers');
 
 const { policy } = require('../src/config/passwordPolicy');
 
-const P0 = 'Gr8t!Horizon#77';
+const P0 = DEFAULT_PASSWORD;
 const P1 = 'Blue-Kettle_42x!';
 const P2 = 'Winter*Maple9Road';
 const P3 = 'Copper&Lantern31z';
 const P4 = 'Orbit$Velvet58Kite';
-
-/**
- * Starts a fresh copy of the API on a random port. The rate limiters keep their
- * counters in module memory, so each group of tests loads its own copy of src/
- * and gets its own 10-request budget.
- */
-async function startApi() {
-  for (const file of Object.keys(require.cache)) {
-    if (file.startsWith(SRC_DIR)) delete require.cache[file];
-  }
-  const models = require('../src/models');
-  const app = require('../src/app');
-  await models.sequelize.sync();
-
-  const server = await new Promise((resolve) => {
-    const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
-  });
-  const base = `http://127.0.0.1:${server.address().port}/api/auth`;
-
-  async function post(route, body, rawBody) {
-    const response = await fetch(`${base}${route}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: rawBody ?? JSON.stringify(body),
-    });
-    const text = await response.text();
-    return { status: response.status, text, body: text ? JSON.parse(text) : null };
-  }
-
-  return {
-    models,
-    register: (username, password = P0) =>
-      post('/register', { username, email: `${username}@example.com`, password }),
-    change: (body) => post('/change-password', body),
-    changeRaw: (rawBody) => post('/change-password', null, rawBody),
-    async stop() {
-      await new Promise((resolve) => server.close(resolve));
-      await models.sequelize.close();
-    },
-  };
-}
-
-after(() => {
-  fs.rmSync(DB_FILE, { force: true });
-});
+const WRONG = 'Wrong!Pass#1234';
 
 describe('change password: success and credentials', () => {
   let api;

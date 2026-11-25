@@ -37,7 +37,8 @@ Comunication_LTD/
 │       ├── utils/crypto.js           # salt, HMAC-SHA256, timing-safe verify
 │       ├── middleware/               # validate (Zod), errorHandler
 │       ├── routes/auth.routes.js     # /api/auth/password-policy, /register, /change-password
-│       └── routes/login.routes.js    # /api/auth/login (lockout after failed attempts)
+│       ├── routes/login.routes.js    # /api/auth/login
+│       └── services/accountLockout.js # lockout shared by login and change password
 │   └── test/                         # automated API tests (node --test)
 └── frontend/               # React app (ES modules) - its own package.json & node_modules
     ├── .env.example        # optional API URL override
@@ -167,7 +168,7 @@ and is managed by the system administrator.
 | `complexity`       | all `true` | Require uppercase, lowercase, digits, special characters  |
 | `historyCount`     | 3     | Previous passwords that may not be reused when changing password |
 | `dictionary`       | list  | Password may not contain any of these words (case-insensitive) |
-| `maxLoginAttempts` | 3     | Consecutive failed logins before the account is locked         |
+| `maxLoginAttempts` | 3     | Consecutive wrong passwords (login or change password) before the account is locked |
 | `lockoutMinutes`   | 15    | How long the account stays locked after that                   |
 
 - The file is validated at startup. A wrong type or unsafe value (e.g. `minLength` below 8)
@@ -176,8 +177,8 @@ and is managed by the system administrator.
 - The React form downloads the public part of the policy (`GET /api/auth/password-policy`), so
   the browser checklist always matches the server. The dictionary and the login-attempt and
   lockout settings are **not** sent to the browser.
-- `maxLoginAttempts` and `lockoutMinutes` are enforced by the login screen (`failed_login_attempts`
-  / `locked_until` columns). `historyCount` is loaded and the `password_history` table is ready
+- `maxLoginAttempts` and `lockoutMinutes` are enforced by login **and** change password, with one
+  shared per-account counter (`failed_login_attempts` / `locked_until` columns). `historyCount` is loaded and the `password_history` table is ready
   for it; it is enforced by change-password.
 
 ---
@@ -206,6 +207,7 @@ Body (JSON, max 10 KB): `{ "username": "...", "currentPassword": "...", "newPass
 | 200    | Changed → `{ message }`                                                   |
 | 400    | Validation failed, or the new password equals the current one or one of the last `historyCount` passwords → `{ error, formErrors, fieldErrors }` |
 | 401    | Unknown username or wrong current password (one identical message)        |
+| 423    | Account locked after `maxLoginAttempts` wrong passwords (login and change password count together); `Retry-After` header set |
 | 429    | More than 10 change attempts from the same IP within 15 minutes           |
 | 500    | Unexpected error → generic message only                                   |
 
@@ -217,7 +219,7 @@ Body (JSON, max 10 KB): `{ "username": "...", "password": "..." }`
 | 200    | Logged in → `{ message, user: { id, username, email } }` (no salt / hash) |
 | 400    | Validation failed (missing field, non-string, bad username format, extra key) |
 | 401    | Unknown username **or** wrong password (one message: `Invalid username or password`) |
-| 423    | Account locked after `maxLoginAttempts` failures; `Retry-After` header set |
+| 423    | Account locked after `maxLoginAttempts` wrong passwords (login and change password count together); `Retry-After` header set |
 | 429    | More than 10 failed logins from the same IP within 15 minutes             |
 | 500    | Unexpected error → generic message only                                   |
 
@@ -261,8 +263,8 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
   plain data. Registration writes through the **Sequelize ORM**, which sends `INSERT` values as
   **bound parameters** (`$1, $2 ...`). Note that Sequelize's `SELECT` finders (`findOne`) do not
   bind: they *escape* the value into the SQL text (`'x'' OR 1=1--'`). That is safe, but it is
-  escaping, not parameters, so the login screen uses **explicit parameterized queries** instead
-  (see 10).
+  escaping, not parameters, so login and change password use **explicit parameterized queries**
+  instead (see 10 and 11).
 - **Allowlist validation** comes first: usernames may only contain `a-z 0-9 _`, so such payloads
   are rejected with `400` before reaching the database.
 - The approach is **validate + parameterize**, not "strip dangerous characters" - stripping is
@@ -319,7 +321,8 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
   from memory after success, and separate messages for network, 400, 409, 429 and 500 errors.
 
 ### 10. Login: account lockout and no user enumeration
-[backend/src/routes/login.routes.js](backend/src/routes/login.routes.js)
+[backend/src/routes/login.routes.js](backend/src/routes/login.routes.js),
+[backend/src/services/accountLockout.js](backend/src/services/accountLockout.js)
 - **Verification:** the server recomputes `HMAC-SHA256(salt + password)` with the user's stored
   salt and compares it to the stored hash with `crypto.timingSafeEqual`. The password itself is
   never stored, logged or compared in plain text.
@@ -336,7 +339,8 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
   so `' OR 1=1--` is rejected with `400` before any query runs. Type-confusion payloads
   (`{"$gt": ""}`) and extra keys are rejected too. A password is never part of any SQL: it is
   only fed into the HMAC.
-- **Account lockout (from the policy file):** before the password is checked, one atomic conditional
+- **Account lockout (from the policy file):** the lockout lives in `services/accountLockout.js` and
+  is shared with change password (see 11), on the same per-account counter. Before the password is checked, one atomic conditional
   `UPDATE ... WHERE <not locked> ... RETURNING failed_login_attempts` reserves the attempt, so parallel requests cannot slip
   extra guesses past the limit: SQLite runs the statements one at a time, so 100 requests sent
   at once get the numbers 1 to 100, and only numbers up to `maxLoginAttempts` (3) are allowed to
@@ -354,33 +358,44 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
 - **Per-IP rate limit** on failed logins (see 7) adds a second layer against password spraying
   across many accounts.
 - **Data minimization:** the success response lists only `id`, `username`, `email`. The salt,
-  hash and lockout fields are read only inside the login handler and never sent.
+  hash and lockout fields are read only inside the server and never sent.
 - **Client:** `autoComplete="current-password"`, the password field is cleared after every
   attempt (success or failure), and server text is rendered as escaped JSX text.
 
 ### 11. Change password
 [backend/src/routes/auth.routes.js](backend/src/routes/auth.routes.js)
-- The same pipeline as registration: strict Zod schema (strings only, no unknown keys),
-  normalized username checked against the allowlist, then an ORM lookup with a **bound
-  parameter**. `' OR 1=1--` as a username is rejected with `400`; as a password it is just a
-  wrong password (`401`).
+- The same pipeline as registration: strict Zod schema (strings only, no unknown keys) and
+  the username allowlist. Every query of this route is an **explicit parameterized query**
+  (`sequelize.query` with `bind`): the user lookup and lockout counter (shared with login), the
+  `password_history` lookup, and the `UPDATE` of the new password. `' OR 1=1--` as a username
+  is rejected with `400`; as a password it is just a wrong password (`401`).
 - **The current password is required** and verified with the stored salt and
   `crypto.timingSafeEqual`. Knowing a username is not enough to change its password.
 - **No user enumeration**: an unknown username and a wrong password return the same `401`
   message, and the unknown-username path still performs one HMAC comparison so its response
   time is similar.
+- **Account lockout, the same as login (see 10):** a wrong current password is a password
+  guess, so it goes through the same code and the **same per-account counter**. The attempt is
+  reserved atomically before the password is checked; after `maxLoginAttempts` (3) wrong
+  passwords, on login and change password together, the account is locked for `lockoutMinutes`
+  (15) and both routes answer `423` with `Retry-After` without checking the password, even a
+  correct one. Parallel requests cannot get extra guesses. A correct current password resets
+  the counter: on success the reset is in the same transaction as the password update, and it
+  also happens when only the new password is rejected (history), so a user who picks an old
+  password is not locked out.
 - **Password history**: the new password is compared (each with its own salt) against the
   current password and the last `historyCount` rows of `password_history`. A match returns `400`.
 - The new password gets the **full policy** (length, complexity, dictionary, must not contain
   the username) and a **new random salt**.
-- The `users` update and the new `password_history` row are written in **one transaction**.
-- **Rate limited** (10 attempts / 15 minutes per IP), because every attempt is a guess at the
-  current password.
+- The `users` update (new salt and hash, lockout counter reset) and the new `password_history`
+  row are written in **one transaction**.
+- **Rate limited** per IP as well (10 attempts / 15 minutes), against guessing across many
+  accounts.
 - **Stored XSS**: the only user text this feature could store is the username, which the
   allowlist limits to `a-z 0-9 _`; passwords are stored only as hashes. Responses never echo
   submitted values, and React renders all text escaped.
 - In the browser, the password fields are cleared after success, the current password is
-  cleared after a `401`, and switching screens unmounts the form.
+  cleared after a `401` or `423`, and switching screens unmounts the form.
 
 ---
 
@@ -400,9 +415,6 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
   limit keeps it from being used to scan many usernames.
 - Lockout can be used to lock out a known user on purpose (denial of service). The lock is
   temporary (`lockoutMinutes`) for that reason; production systems add CAPTCHA or e-mail unlock.
-- Change password is limited per IP only. Account lockout after `maxLoginAttempts` failures
-  arrives with the login stage; until then a distributed attacker is slowed per address, not
-  per account.
 - `sequelize.sync()` creates missing tables only; production would use versioned migrations.
 - Keep the project outside OneDrive-synced folders (e.g. `C:\dev\`): syncing can lock the SQLite
   file and slows down `node_modules`.
@@ -415,11 +427,12 @@ passwordHash = HMAC-SHA256(key = HMAC_SECRET, msg = salt + password)  → 64 hex
 npm --prefix backend test
 ```
 
-Runs the change-password API tests with Node's built-in test runner (no extra packages). They
-use a temporary SQLite file and a random HMAC secret, so the real database and `.env` secret are
-not touched. Covered: success, wrong password / unknown user (`401`), password history, weak and
-dictionary passwords, SQL injection, XSS and operator-object payloads, unknown keys, malformed
-JSON, and the rate limit.
+Runs the login and change-password API tests with Node's built-in test runner (no extra
+packages). They use a temporary SQLite file and a random HMAC secret, so the real database and
+`.env` secret are not touched. Covered: success, wrong password / unknown user (`401`), account
+lockout (`423`, shared between login and change password, counter reset, lock expiry, parallel
+requests), password history, weak and dictionary passwords, SQL injection, XSS and
+operator-object payloads, unknown keys, malformed JSON, and the rate limit.
 
 ## Manual tests (PowerShell)
 
@@ -436,11 +449,6 @@ Register "{`"username`":`"x' OR 1=1--`",`"email`":`"a@b.co`",`"password`":`"Gr8t
 Register '{"username":{"$gt":""},"email":"a@b.co","password":"Gr8t!Horizon#77"}'          # 400
 Register '{"username":"eve","email":"e@b.co","password":"Gr8t!Horizon#77","salt":"00"}'   # 400
 Register '{"username":"weak","email":"w@b.co","password":"MyPassword#2026"}'              # 400 (dictionary)
-
-$api = 'http://127.0.0.1:4000/api/auth/change-password'
-Register '{"username":"dana_2","currentPassword":"Gr8t!Horizon#77","newPassword":"Blue-Kettle_42x!"}'  # 200
-Register '{"username":"dana_2","currentPassword":"Gr8t!Horizon#77","newPassword":"Winter*Maple9Road"}' # 401 (old password)
-Register '{"username":"dana_2","currentPassword":"Blue-Kettle_42x!","newPassword":"Gr8t!Horizon#77"}'  # 400 (used recently)
 ```
 
 Login (run after the registration of `dana_2` above):
@@ -460,6 +468,25 @@ Login '{"username":"dana_2","password":"Wrong!Pass#1"}'             # 401 (1st f
 Login '{"username":"dana_2","password":"Wrong!Pass#2"}'             # 401 (2nd failure)
 Login '{"username":"dana_2","password":"Wrong!Pass#3"}'             # 423 (3rd failure -> locked)
 Login '{"username":"dana_2","password":"Gr8t!Horizon#77"}'          # 423 (locked, even with the right password)
+```
+
+Change password (uses its own user, `cp_demo`):
+
+```powershell
+$cp = 'http://127.0.0.1:4000/api/auth/change-password'
+function ChangePw($body) {
+  try { Invoke-RestMethod -Method Post -Uri $cp -ContentType 'application/json' -Body $body }
+  catch { $_.Exception.Response.StatusCode.value__; $_.ErrorDetails.Message }
+}
+
+Register '{"username":"cp_demo","email":"cp@example.com","password":"Gr8t!Horizon#77"}'                       # 201
+ChangePw '{"username":"cp_demo","currentPassword":"Gr8t!Horizon#77","newPassword":"Blue-Kettle_42x!"}'   # 200
+ChangePw '{"username":"cp_demo","currentPassword":"Blue-Kettle_42x!","newPassword":"Gr8t!Horizon#77"}'   # 400 (used recently)
+ChangePw '{"username":"cp_demo","currentPassword":"Wrong!Pass#1","newPassword":"Winter*Maple9Road"}'     # 401 (1st wrong password)
+ChangePw '{"username":"cp_demo","currentPassword":"Wrong!Pass#2","newPassword":"Winter*Maple9Road"}'     # 401 (2nd)
+ChangePw '{"username":"cp_demo","currentPassword":"Wrong!Pass#3","newPassword":"Winter*Maple9Road"}'     # 423 (3rd -> locked)
+ChangePw '{"username":"cp_demo","currentPassword":"Blue-Kettle_42x!","newPassword":"Winter*Maple9Road"}' # 423 (locked, even with the right password)
+Login '{"username":"cp_demo","password":"Blue-Kettle_42x!"}'                                             # 423 (the lock is shared with login)
 ```
 
 ## Troubleshooting

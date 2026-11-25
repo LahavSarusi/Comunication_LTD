@@ -82,8 +82,8 @@ function ChangePassword() {
       const { message, fieldErrors: serverFieldErrors } = parseApiError(error)
       setServerError(message)
       setFieldErrors(serverFieldErrors)
-      // After wrong credentials the current password is cleared; the user retypes it.
-      if (error.response?.status === 401) {
+      // After wrong credentials or a lockout the current password is cleared; the user retypes it.
+      if (error.response?.status === 401 || error.response?.status === 423) {
         setForm((previous) => ({ ...previous, currentPassword: '' }))
       }
     } finally {
