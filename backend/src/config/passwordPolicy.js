@@ -23,6 +23,8 @@ const policySchema = z
     }),
     // Failed logins allowed before the account is locked (enforced by login).
     maxLoginAttempts: z.int().min(1).max(100),
+    // How long an account stays locked after maxLoginAttempts failed logins.
+    lockoutMinutes: z.int().min(1).max(1440),
   })
   .refine((policy) => policy.maxLength >= policy.minLength, {
     message: 'maxLength must be greater than or equal to minLength',
@@ -58,7 +60,7 @@ function loadPolicy() {
 const policy = loadPolicy();
 
 // Only what the browser needs to show and pre-check the rules. The dictionary and
-// login-attempt limit stay server-side so they are not handed to attackers.
+// the login-attempt/lockout settings stay server-side so they are not handed to attackers.
 const publicPolicy = deepFreeze({
   minLength: policy.minLength,
   maxLength: policy.maxLength,
