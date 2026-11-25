@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import ChangePassword from './components/ChangePassword/ChangePassword.jsx'
 import Login from './components/Login/Login.jsx'
 import Register from './components/Register/Register.jsx'
 import './App.css'
@@ -6,6 +7,7 @@ import './App.css'
 const SCREENS = [
   { id: 'register', label: 'Register', Component: Register },
   { id: 'login', label: 'Login', Component: Login },
+  { id: 'change-password', label: 'Change password', Component: ChangePassword },
 ]
 
 function App() {

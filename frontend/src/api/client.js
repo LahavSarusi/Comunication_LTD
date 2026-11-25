@@ -22,6 +22,12 @@ export async function registerUser({ username, email, password }) {
   return data
 }
 
+// Sends only the three fields the API expects (confirmPassword stays in the browser).
+export async function changePassword({ username, currentPassword, newPassword }) {
+  const { data } = await api.post('/api/auth/change-password', { username, currentPassword, newPassword })
+  return data
+}
+
 /**
  * Turns an axios error into a message for the user. Server internals are never
  * shown: unexpected statuses get a generic message.
@@ -41,8 +47,19 @@ export function parseApiError(error) {
         message: data?.formErrors?.[0] ?? 'Please fix the highlighted fields.',
         fieldErrors: data?.fieldErrors ?? {},
       }
+    // The server does not say which of the two was wrong, and neither do we.
+    case 401:
+      return { message: 'Incorrect username or current password.', fieldErrors: {} }
     case 409:
       return { message: 'This username or email is already in use.', fieldErrors: {} }
+    // Account lockout: the server's message says how long the lock lasts. It is plain
+    // text and rendered escaped by React.
+    case 423:
+      return {
+        message:
+          typeof data?.error === 'string' ? data.error : 'This account is temporarily locked. Please try again later.',
+        fieldErrors: {},
+      }
     case 429:
       return { message: 'Too many attempts. Please wait a few minutes and try again.', fieldErrors: {} }
     default:
