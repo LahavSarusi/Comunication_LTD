@@ -3,6 +3,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const { CORS_ORIGIN } = require('./config/env');
 const authRoutes = require('./routes/auth.routes');
+const loginRoutes = require('./routes/login.routes');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -26,6 +27,7 @@ app.use(
 app.use(express.json({ limit: '10kb', strict: true }));
 
 app.use('/api/auth', authRoutes);
+app.use('/api/auth', loginRoutes);
 
 app.use(notFound);
 app.use(errorHandler);
